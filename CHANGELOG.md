@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Answer NACKs without RTX by resending the original packet on the media SSRC
   * Limit paced media bursts to about 63 kB #1058
 
 # 0.24.0

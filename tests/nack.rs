@@ -311,3 +311,238 @@ pub fn nack_delay() -> Result<(), RtcError> {
 
     Ok(())
 }
+
+/// Without RTX negotiated, a NACKed packet is resent unchanged on the media
+/// SSRC (RFC 4585), rather than the NACK being ignored.
+#[test]
+pub fn loss_recovery_without_rtx() -> Result<(), RtcError> {
+    use common::{Peer, connect_l_r_with_rtc};
+    use str0m::Rtc;
+    use str0m::media::Frequency;
+
+    init_log();
+    init_crypto_default();
+
+    let vp8_without_rtx = |peer: Peer| {
+        let mut config = Rtc::builder()
+            .set_rtp_mode(true)
+            .enable_raw_packets(true)
+            .clear_codecs();
+        config.codec_config().add_config(
+            96.into(),
+            None,
+            Codec::Vp8,
+            Frequency::NINETY_KHZ,
+            None,
+            Default::default(),
+        );
+        if let Some(crypto) = peer.crypto_provider() {
+            config = config.set_crypto_provider(crypto);
+        }
+        config.build(Instant::now())
+    };
+    let (mut l, mut r) =
+        connect_l_r_with_rtc(vp8_without_rtx(Peer::Left), vp8_without_rtx(Peer::Right));
+
+    r.set_netem(NetemConfig::new());
+
+    let mid = "vid".into();
+    let ssrc_tx: Ssrc = 42.into();
+
+    l.direct_api().declare_media(mid, MediaKind::Video);
+    l.direct_api().declare_stream_tx(ssrc_tx, None, mid, None);
+    r.direct_api().declare_media(mid, MediaKind::Video);
+    r.direct_api().expect_stream_rx(ssrc_tx, None, mid, None);
+
+    let max = l.last.max(r.last);
+    l.last = max;
+    r.last = max;
+
+    let params = l.params_vp8();
+    assert!(
+        params.resend().is_none(),
+        "the test is about a PT without RTX"
+    );
+    let pt = params.pt();
+
+    let to_write = [0x1, 0x2, 0x3, 0x4];
+    let num_packets: usize = 1000;
+
+    for index in 0..num_packets {
+        let wallclock = l.start + l.duration();
+        let mut direct = l.direct_api();
+        let stream = direct.stream_tx(&ssrc_tx).unwrap();
+        let time = (index * 1000 + 47_000_000) as u32;
+        let seq_no = (47_000 + index as u64).into();
+        stream.write_rtp(RtpWrite::new(pt, seq_no, time, wallclock, to_write).nackable(true));
+
+        // Loss only in the middle, as in `loss_recovery`.
+        if index == 10 {
+            r.set_netem(
+                NetemConfig::new()
+                    .loss(RandomLoss::new(Probability::new(0.05)))
+                    .seed(42),
+            );
+        }
+        if index == 990 {
+            r.set_netem(NetemConfig::new());
+        }
+
+        progress(&mut l, &mut r)?;
+    }
+
+    let settle_time = l.duration() + Duration::from_secs(10);
+    while l.duration() <= settle_time {
+        progress(&mut l, &mut r)?;
+    }
+
+    let nacks_rx = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e.as_raw_packet(), Some(RawPacket::RtcpRx(Rtcp::Nack(_)))))
+        .count();
+    assert!(nacks_rx > 0, "the receiver NACKed the loss");
+
+    let rtp_rx: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e.as_raw_packet() {
+            Some(RawPacket::RtpRx(p, _)) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rtp_rx
+            .iter()
+            .all(|p| p.ssrc == ssrc_tx && p.payload_type == pt),
+        "every packet, resends included, is on the media SSRC and PT"
+    );
+
+    let mut seqs: Vec<u16> = rtp_rx.iter().map(|p| p.sequence_number).collect();
+    seqs.sort();
+    seqs.dedup();
+    assert_eq!(seqs.first(), Some(&47_000));
+    assert_eq!(seqs.last(), Some(&47_999));
+    assert_eq!(seqs.len(), num_packets, "and the loss was recovered");
+
+    Ok(())
+}
+
+/// The same when the stream has an RTX SSRC but the payload type has no RTX:
+/// an SFU declares one repair SSRC per stream up front, and a receiver can
+/// still answer without the RTX payload type. What decides is the payload
+/// type the packet was sent on.
+#[test]
+pub fn loss_recovery_without_rtx_pt_on_a_stream_with_an_rtx_ssrc() -> Result<(), RtcError> {
+    use common::{Peer, connect_l_r_with_rtc};
+    use str0m::Rtc;
+    use str0m::media::Frequency;
+
+    init_log();
+    init_crypto_default();
+
+    let vp8_without_rtx = |peer: Peer| {
+        let mut config = Rtc::builder()
+            .set_rtp_mode(true)
+            .enable_raw_packets(true)
+            .clear_codecs();
+        config.codec_config().add_config(
+            96.into(),
+            None,
+            Codec::Vp8,
+            Frequency::NINETY_KHZ,
+            None,
+            Default::default(),
+        );
+        if let Some(crypto) = peer.crypto_provider() {
+            config = config.set_crypto_provider(crypto);
+        }
+        config.build(Instant::now())
+    };
+    let (mut l, mut r) =
+        connect_l_r_with_rtc(vp8_without_rtx(Peer::Left), vp8_without_rtx(Peer::Right));
+
+    r.set_netem(NetemConfig::new());
+
+    let mid = "vid".into();
+    let ssrc_tx: Ssrc = 42.into();
+
+    l.direct_api().declare_media(mid, MediaKind::Video);
+    l.direct_api()
+        .declare_stream_tx(ssrc_tx, Some(44.into()), mid, None);
+    r.direct_api().declare_media(mid, MediaKind::Video);
+    r.direct_api().expect_stream_rx(ssrc_tx, None, mid, None);
+
+    let max = l.last.max(r.last);
+    l.last = max;
+    r.last = max;
+
+    let params = l.params_vp8();
+    assert!(
+        params.resend().is_none(),
+        "the test is about a PT without RTX"
+    );
+    let pt = params.pt();
+
+    let to_write = [0x1, 0x2, 0x3, 0x4];
+    let num_packets: usize = 1000;
+
+    for index in 0..num_packets {
+        let wallclock = l.start + l.duration();
+        let mut direct = l.direct_api();
+        let stream = direct.stream_tx(&ssrc_tx).unwrap();
+        let time = (index * 1000 + 47_000_000) as u32;
+        let seq_no = (47_000 + index as u64).into();
+        stream.write_rtp(RtpWrite::new(pt, seq_no, time, wallclock, to_write).nackable(true));
+
+        // Loss only in the middle, as in `loss_recovery`.
+        if index == 10 {
+            r.set_netem(
+                NetemConfig::new()
+                    .loss(RandomLoss::new(Probability::new(0.05)))
+                    .seed(42),
+            );
+        }
+        if index == 990 {
+            r.set_netem(NetemConfig::new());
+        }
+
+        progress(&mut l, &mut r)?;
+    }
+
+    let settle_time = l.duration() + Duration::from_secs(10);
+    while l.duration() <= settle_time {
+        progress(&mut l, &mut r)?;
+    }
+
+    let nacks_rx = l
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e.as_raw_packet(), Some(RawPacket::RtcpRx(Rtcp::Nack(_)))))
+        .count();
+    assert!(nacks_rx > 0, "the receiver NACKed the loss");
+
+    let rtp_rx: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e.as_raw_packet() {
+            Some(RawPacket::RtpRx(p, _)) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rtp_rx
+            .iter()
+            .all(|p| p.ssrc == ssrc_tx && p.payload_type == pt),
+        "every packet, resends included, is on the media SSRC and PT"
+    );
+
+    let mut seqs: Vec<u16> = rtp_rx.iter().map(|p| p.sequence_number).collect();
+    seqs.sort();
+    seqs.dedup();
+    assert_eq!(seqs.first(), Some(&47_000));
+    assert_eq!(seqs.last(), Some(&47_999));
+    assert_eq!(seqs.len(), num_packets, "and the loss was recovered");
+
+    Ok(())
+}

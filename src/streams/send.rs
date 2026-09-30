@@ -588,14 +588,15 @@ impl StreamTx {
                     // since the above loop figuring out param needs to be correct also
                     // for the NextPacketKind::Blank case.
                     set_pt_for_padding = Some(pt_main);
-                } else {
-                    // If the PT we're sending on doesn't have a corresponding RTX PT,
-                    // the packet is de-facto not nackable.
-                    //
-                    // This blocks incoming NACK requests and thus ensures there are no
-                    // entries in self.retries without a RTX PT.
+                } else if is_red_packet || !param.fb_nack {
+                    // RED carries its own redundancy, and without `nack` feedback no NACK
+                    // can arrive: either way the packet is de-facto not nackable, and is
+                    // kept out of the RTX cache.
                     next.pkt.nackable = false;
                 }
+                // Otherwise a nackable packet on a PT without RTX stays nackable: a NACK
+                // for it is answered by resending the packet unchanged on the media SSRC,
+                // as RFC 4585 allows and libwebrtc does when RTX is not negotiated.
 
                 let clock_rate = param.spec().rtp_clock_rate();
                 set_cr = Some(clock_rate);
@@ -619,9 +620,20 @@ impl StreamTx {
                 header.sequence_number = *next.seq_no as u16;
                 header
             }
+            NextPacketKind::Resend(_) if param.resend().is_none() || ssrc_rtx.is_none() => {
+                // No RTX for this PT: retransmit on the media stream itself, the cached
+                // packet exactly as first sent (PT, SSRC, sequence number and timestamp).
+                //
+                // Padding never takes this path on purpose. A spurious resend is only
+                // padding because the receiver discards it as RTX it did not ask for; on
+                // the media SSRC it would be a duplicate media packet.
+                if is_padding {
+                    return None;
+                }
+                header_ref.clone()
+            }
             NextPacketKind::Resend(_) | NextPacketKind::Blank(_) => {
-                // * For the Resend case, we will not have accepted/cached the packet unless
-                //   we have a RTX PT (see logic setting next.pkt.nackable above).
+                // * For the Resend case, the arm above handles a PT without RTX.
                 // * For the Blank case, we will only have produced blank packets if we
                 //   got a "real" PTX RT, either via set_pt_for_padding above, or via
                 //   the on_first_timeout() further down.
@@ -669,9 +681,11 @@ impl StreamTx {
 
         let mut body_out = &mut buf[header_len..];
 
-        // For resends, the original seq_no is inserted before the payload.
+        // For RTX resends, the original seq_no is inserted before the payload. A resend on
+        // the media SSRC keeps its own sequence number in the header instead.
         let mut original_seq_len = 0;
-        if let NextPacketKind::Resend(orig_seq_no) = next.kind {
+        let rtx_resend = header.ssrc != next.pkt.header.ssrc;
+        if let (NextPacketKind::Resend(orig_seq_no), true) = (next.kind, rtx_resend) {
             original_seq_len = RtpHeader::write_original_sequence_number(body_out, orig_seq_no);
             body_out = &mut body_out[original_seq_len..];
         }
